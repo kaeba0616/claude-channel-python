@@ -30,6 +30,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_channel"]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "anyio[trio]"]
 examples = ["aiohttp>=3.9.0,<4"]

@@ -11,7 +11,8 @@ Python SDK for [Claude Code Channels](https://code.claude.com/docs/en/channels-r
 ## Installation
 
 ```bash
-pip install -e .
+pip install claude-channel            # from PyPI
+pip install -e .                      # for development
 ```
 
 ## Quick Start
@@ -19,6 +20,7 @@ pip install -e .
 ### One-way channel (push events to Claude)
 
 ```python
+import asyncio
 from claude_channel import Channel
 
 channel = Channel(
@@ -26,11 +28,13 @@ channel = Channel(
     instructions="Events from webhook channel. One-way, no reply expected.",
 )
 
-# Push an event to Claude Code
-await channel.send("build failed on main", meta={"severity": "high"})
+async def main():
+    # Push an event to Claude Code
+    await channel.send("build failed on main", meta={"severity": "high"})
+    # Start the server (stdio transport)
+    await channel.run_async()
 
-# Start the server (blocking, stdio transport)
-channel.run()
+asyncio.run(main())
 ```
 
 ### Two-way channel (Claude can reply)
