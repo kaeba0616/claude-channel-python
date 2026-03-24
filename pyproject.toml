@@ -1,0 +1,16 @@
+[project]
+name = "claude-channel"
+version = "0.1.0"
+description = "Python SDK for Claude Code Channels"
+requires-python = ">=3.11"
+dependencies = ["mcp>=1.20.0", "anyio>=4.0.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_channel"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "anyio[trio]"]
