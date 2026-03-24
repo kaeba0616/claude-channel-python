@@ -11,8 +11,15 @@ Python SDK for [Claude Code Channels](https://code.claude.com/docs/en/channels-r
 ## Installation
 
 ```bash
-pip install claude-channel            # from PyPI
-pip install -e .                      # for development
+pip install git+https://github.com/kaeba0616/claude-channel-python.git
+```
+
+For development:
+
+```bash
+git clone https://github.com/kaeba0616/claude-channel-python.git
+cd claude-channel-python
+pip install -e ".[dev]"
 ```
 
 ## Quick Start
