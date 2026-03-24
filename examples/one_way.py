@@ -5,6 +5,13 @@ Listens for HTTP POSTs on port 8788 and forwards them to Claude Code.
 Run with: claude --dangerously-load-development-channels server:webhook
 
 Test with: curl -X POST localhost:8788 -d "build failed on main"
+
+WARNING: This example has no authentication or rate limiting.
+In production, you MUST:
+  - Validate a shared secret, API key, or HMAC signature on each request
+  - Limit request body size to prevent memory exhaustion
+  - Restrict to trusted source IPs or use TLS client certificates
+  - Add rate limiting to prevent flooding the Claude Code session
 """
 
 import asyncio

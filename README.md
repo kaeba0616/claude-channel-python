@@ -258,4 +258,4 @@ See the [`examples/`](examples/) directory:
 - Channels require `claude.ai` login. Console and API key authentication is not supported.
 - Team and Enterprise organizations must explicitly enable channels.
 - During the research preview, use `--dangerously-load-development-channels` to test custom channels.
-- Meta keys must be identifiers (letters, digits, underscores). Keys with hyphens are silently dropped.
+- Meta keys must be valid identifiers (letters, digits, underscores, starting with a letter or underscore). Invalid keys raise a `ValueError`.

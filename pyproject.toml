@@ -3,7 +3,7 @@ name = "claude-channel"
 version = "0.1.0"
 description = "Python SDK for Claude Code Channels"
 requires-python = ">=3.11"
-dependencies = ["mcp>=1.20.0", "anyio>=4.0.0"]
+dependencies = ["mcp>=1.20.0,<2", "anyio>=4.0.0,<5"]
 
 [build-system]
 requires = ["hatchling"]
@@ -14,3 +14,4 @@ packages = ["src/claude_channel"]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio", "anyio[trio]"]
+examples = ["aiohttp>=3.9.0,<4"]

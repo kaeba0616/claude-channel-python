@@ -97,6 +97,7 @@ class TestInferSchema:
                 "b": {"type": "string"},
             },
             "required": ["a", "b"],
+            "additionalProperties": False,
         }
 
     def test_mixed_types(self):
@@ -118,12 +119,140 @@ class TestInferSchema:
         assert schema["required"] == ["required"]
         assert "optional" in schema["properties"]
 
+    def test_unsupported_types_default_to_string(self):
+        async def func(data: dict, items: list) -> str:
+            return ""
+
+        schema = _infer_schema(func)
+        assert schema["properties"]["data"] == {"type": "string"}
+        assert schema["properties"]["items"] == {"type": "string"}
+
+    def test_additional_properties_false(self):
+        async def func(x: str) -> str:
+            return ""
+
+        schema = _infer_schema(func)
+        assert schema["additionalProperties"] is False
+
+
+class TestArgumentFiltering:
+    """I1: Extra arguments must be filtered before passing to handler."""
+
+    @pytest.mark.asyncio
+    async def test_extra_arguments_filtered_out(self):
+        ch = Channel("test")
+        received_kwargs = {}
+
+        @ch.tool("safe", description="A safe tool")
+        async def safe(x: str) -> str:
+            received_kwargs.update({"x": x})
+            return "ok"
+
+        # Simulate what _register_tools + call_tool does internally
+        tool_def, handler = ch._tools["safe"]
+        schema_keys = set(tool_def.inputSchema.get("properties", {}).keys())
+        args = {"x": "good", "malicious": "evil", "__class__": "bad"}
+        filtered = {k: v for k, v in args.items() if k in schema_keys}
+        result = await handler(**filtered)
+
+        assert result == "ok"
+        assert received_kwargs == {"x": "good"}
+        assert "malicious" not in received_kwargs
+        assert "__class__" not in received_kwargs
+
+
+class TestMetaKeyValidation:
+    """C1: Meta keys must be valid identifiers."""
+
+    def test_valid_keys(self):
+        import asyncio
+        ch = Channel("test")
+        asyncio.run(ch.send("hello", meta={"severity": "high", "run_id": "42", "_private": "x"}))
+        assert len(ch._pending) == 1
+
+    def test_rejects_hyphenated_key(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid meta key"):
+            asyncio.run(ch.send("hello", meta={"my-key": "val"}))
+
+    def test_rejects_key_with_quotes(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid meta key"):
+            asyncio.run(ch.send("hello", meta={'foo" injected="true': "val"}))
+
+    def test_rejects_key_starting_with_digit(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid meta key"):
+            asyncio.run(ch.send("hello", meta={"1abc": "val"}))
+
+    def test_rejects_empty_key(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid meta key"):
+            asyncio.run(ch.send("hello", meta={"": "val"}))
+
+
+class TestPermissionVerdictValidation:
+    """C2: request_id and behavior must be valid."""
+
+    def test_valid_verdict(self):
+        import asyncio
+        ch = Channel("test")
+        asyncio.run(ch.send_permission_verdict("abcde", PermissionBehavior.ALLOW))
+        assert len(ch._pending) == 1
+
+    def test_rejects_short_request_id(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid request_id"):
+            asyncio.run(ch.send_permission_verdict("abc", PermissionBehavior.ALLOW))
+
+    def test_rejects_request_id_with_l(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid request_id"):
+            asyncio.run(ch.send_permission_verdict("abcle", PermissionBehavior.ALLOW))
+
+    def test_rejects_uppercase_request_id(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid request_id"):
+            asyncio.run(ch.send_permission_verdict("ABCDE", PermissionBehavior.ALLOW))
+
+    def test_rejects_invalid_behavior_string(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid behavior"):
+            asyncio.run(ch.send_permission_verdict("abcde", "yolo"))
+
+    def test_rejects_empty_request_id(self):
+        import asyncio
+        ch = Channel("test")
+        with pytest.raises(ValueError, match="Invalid request_id"):
+            asyncio.run(ch.send_permission_verdict("", PermissionBehavior.ALLOW))
+
+
+class TestPendingQueueBound:
+    """I2: Pending queue should not grow unbounded."""
+
+    def test_queue_drops_oldest_when_full(self):
+        import asyncio
+        ch = Channel("test")
+        for i in range(1100):
+            asyncio.run(ch.send(f"event-{i}"))
+        assert len(ch._pending) == 1000
+        # Oldest events (0-99) should have been evicted
+        _, first_params = ch._pending[0]
+        assert first_params["content"] == "event-100"
+
 
 class TestSendBeforeConnection:
     def test_queues_events(self):
-        ch = Channel("test")
         import asyncio
-
+        ch = Channel("test")
         asyncio.run(ch.send("hello", meta={"key": "val"}))
         assert len(ch._pending) == 1
         method, params = ch._pending[0]
@@ -132,9 +261,8 @@ class TestSendBeforeConnection:
         assert params["meta"] == {"key": "val"}
 
     def test_queues_permission_verdict(self):
-        ch = Channel("test")
         import asyncio
-
+        ch = Channel("test")
         asyncio.run(ch.send_permission_verdict("abcde", PermissionBehavior.ALLOW))
         assert len(ch._pending) == 1
         method, params = ch._pending[0]
@@ -294,4 +422,32 @@ class TestPermissionRequestInterceptor:
         )
 
         await ch._handle_permission_request(msg)
+        mock_session.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_handle_permission_request_exception_logged_not_raised(self):
+        """Exceptions in permission handler are logged, not propagated."""
+        ch = Channel("test", permission_relay=True)
+        mock_session = MagicMock()
+        mock_session.send_message = AsyncMock()
+        ch._session = mock_session
+
+        @ch.on_permission_request()
+        async def handle(req: PermissionRequest) -> PermissionBehavior:
+            raise RuntimeError("handler crashed")
+
+        msg = self._make_session_message(
+            "notifications/claude/channel/permission_request",
+            {
+                "request_id": "abcde",
+                "tool_name": "Bash",
+                "description": "test",
+                "input_preview": "{}",
+            },
+        )
+
+        # Should not raise
+        await ch._handle_permission_request(msg)
+
+        # No verdict sent because handler crashed
         mock_session.send_message.assert_not_called()

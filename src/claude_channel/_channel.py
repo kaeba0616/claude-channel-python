@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
+import re
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from typing import Any
@@ -21,6 +22,17 @@ from ._types import ChannelEvent, PermissionBehavior, PermissionRequest
 
 logger = logging.getLogger(__name__)
 
+# ── Validation patterns ────────────────────────────────────────────────
+
+# Meta keys must be valid identifiers (letters, digits, underscores).
+_META_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Permission request IDs: 5 lowercase letters, no 'l' (Claude Code spec).
+_REQUEST_ID_RE = re.compile(r"^[a-km-z]{5}$")
+
+# Maximum number of events queued before connection is established.
+_MAX_PENDING = 1000
+
 # Mapping from Python type annotations to JSON Schema types
 _TYPE_MAP: dict[type, str] = {
     str: "string",
@@ -33,7 +45,7 @@ _TYPE_MAP: dict[type, str] = {
 def _infer_schema(func: Callable[..., Any]) -> dict[str, Any]:
     """Infer a JSON Schema ``object`` from a function's type hints."""
     sig = inspect.signature(func)
-    hints = {}
+    hints: dict[str, Any] = {}
     try:
         hints = {
             k: v
@@ -41,7 +53,7 @@ def _infer_schema(func: Callable[..., Any]) -> dict[str, Any]:
             if k != "return"
         }
     except Exception:
-        pass
+        logger.warning("Failed to resolve annotations for %s, defaulting to string", func.__name__)
 
     properties: dict[str, Any] = {}
     required: list[str] = []
@@ -56,7 +68,11 @@ def _infer_schema(func: Callable[..., Any]) -> dict[str, Any]:
         if param.default is inspect.Parameter.empty:
             required.append(name)
 
-    schema: dict[str, Any] = {"type": "object", "properties": properties}
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,  # I1: reject unexpected keys
+    }
     if required:
         schema["required"] = required
     return schema
@@ -78,6 +94,17 @@ def _is_permission_request_message(message: SessionMessage | Exception) -> bool:
         )
     except Exception:
         return False
+
+
+def _validate_meta_keys(meta: dict[str, str]) -> None:
+    """Validate that all meta keys are safe identifiers."""
+    for key in meta:
+        if not _META_KEY_RE.match(key):
+            raise ValueError(
+                f"Invalid meta key: {key!r}. "
+                "Keys must contain only letters, digits, and underscores, "
+                "and must start with a letter or underscore."
+            )
 
 
 class Channel:
@@ -115,8 +142,8 @@ class Channel:
         self._permission_handler: Callable[[PermissionRequest], Awaitable[PermissionBehavior | None]] | None = None
         # Session reference, set once run_async() connects
         self._session: ServerSession | None = None
-        # Queue for events sent before connection is established
-        self._pending: list[tuple[str, dict[str, Any]]] = []
+        # I2: Bounded queue for events sent before connection is established
+        self._pending: deque[tuple[str, dict[str, Any]]] = deque(maxlen=_MAX_PENDING)
 
     # ── Sending events ──────────────────────────────────────────────────
 
@@ -127,9 +154,13 @@ class Channel:
             content: The event body (becomes body of ``<channel>`` tag).
             meta: Each key-value pair becomes an attribute on the ``<channel>``
                 tag. Keys must be identifiers (letters, digits, underscores).
+
+        Raises:
+            ValueError: If any meta key is not a valid identifier.
         """
         params: dict[str, Any] = {"content": content}
         if meta:
+            _validate_meta_keys(meta)  # C1: validate before sending
             params["meta"] = meta
 
         if self._session is None:
@@ -152,9 +183,25 @@ class Channel:
         Args:
             request_id: The five-letter ID from the permission request.
             behavior: ``"allow"`` or ``"deny"``.
+
+        Raises:
+            ValueError: If request_id or behavior is invalid.
         """
+        # C2: validate request_id format
+        if not _REQUEST_ID_RE.match(request_id):
+            raise ValueError(
+                f"Invalid request_id: {request_id!r}. "
+                "Must be exactly 5 lowercase letters (a-z, excluding 'l')."
+            )
+
         if isinstance(behavior, PermissionBehavior):
             behavior = behavior.value
+
+        # C2: validate behavior value
+        if behavior not in ("allow", "deny"):
+            raise ValueError(
+                f"Invalid behavior: {behavior!r}. Must be 'allow' or 'deny'."
+            )
 
         params = {"request_id": request_id, "behavior": behavior}
 
@@ -243,7 +290,6 @@ class Channel:
             # notifications against ClientNotification and silently drops
             # unknown types like notifications/claude/channel/permission_request.
             effective_read: MemoryObjectReceiveStream[SessionMessage | Exception] = read_stream
-            intercept_tg = None
 
             if self.permission_relay and self._permission_handler:
                 intercepted_writer, intercepted_reader = anyio.create_memory_object_stream[
@@ -280,7 +326,8 @@ class Channel:
 
                 async with anyio.create_task_group() as tg:
                     async for message in session.incoming_messages:
-                        logger.debug("Received message: %s", message)
+                        # S1: log only message type, not full payload
+                        logger.debug("Received message type: %s", type(message).__name__)
                         tg.start_soon(
                             server._handle_message,
                             message,
@@ -310,13 +357,18 @@ class Channel:
                         message=f"Unknown tool: {name}",
                     )
                 )
-            _, handler = tools[name]
-            result = await handler(**(arguments or {}))
+            tool_def, handler = tools[name]
+            # I1: filter arguments to only schema-declared properties
+            schema_keys = set(tool_def.inputSchema.get("properties", {}).keys())
+            filtered = {k: v for k, v in (arguments or {}).items() if k in schema_keys}
+            result = await handler(**filtered)
             return [types.TextContent(type="text", text=str(result))]
 
     async def _send_raw_notification(self, method: str, params: dict[str, Any]) -> None:
         """Send a raw JSONRPC notification via the session."""
-        assert self._session is not None
+        # S3: explicit check instead of assert
+        if self._session is None:
+            raise RuntimeError("Channel is not connected. Call run() or run_async() first.")
         notification = types.JSONRPCNotification(
             jsonrpc="2.0",
             method=method,
@@ -332,9 +384,12 @@ class Channel:
         if not self._permission_handler:
             return
         try:
-            assert not isinstance(message, Exception)
+            # S3: explicit checks instead of assert
+            if isinstance(message, Exception):
+                return
             root = message.message.root
-            assert isinstance(root, types.JSONRPCNotification)
+            if not isinstance(root, types.JSONRPCNotification):
+                return
 
             params = root.params or {}
             req = PermissionRequest(
